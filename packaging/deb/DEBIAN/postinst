@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+  if ! command -v unfsd >/dev/null 2>&1 \
+     && [ ! -x /usr/sbin/unfsd ] && [ ! -x /usr/local/sbin/unfsd ]; then
+    cat >&2 <<MSG
+wslc-remote: 'unfsd' (UNFS3) was not found and this distribution may not package it.
+             Run: sudo wslc-build-unfsd
+             then verify with: wslc _check
+MSG
+  fi
+fi
+exit 0

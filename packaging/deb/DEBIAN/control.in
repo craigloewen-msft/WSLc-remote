@@ -1,0 +1,18 @@
+Package: wslc-remote
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: all
+Depends: bash (>= 4.0), iproute2
+Recommends: unfs3, curl | wget
+Suggests: build-essential, flex, bison, pkgconf | pkg-config, libtirpc-dev, rpcsvc-proto
+Maintainer: wslc-remote maintainers <noreply@example.invalid>
+Homepage: https://github.com/craigloewen-msft/WSLc-remote
+Description: NFS-accelerated drop-in for the WSL container CLI (wslc)
+ Installs the wslc wrapper (and a "container" alias). Host bind mounts passed
+ to "wslc run -v" are served to the container runtime VM over a loopback NFS
+ export (UNFS3 unfsd) instead of the slower default virtiofs share.
+ .
+ Requires WSL with container support (wslc.exe). The unfsd server comes from
+ the unfs3 package where the distribution has one; otherwise run
+ "sudo wslc-build-unfsd" to build the official release.
