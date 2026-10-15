@@ -30,9 +30,11 @@ bash install.sh
   Run `wslc _check` to test the actual connection instead of relying on the configured
   mode name. After changing `%USERPROFILE%\.wslconfig`, run `wsl --shutdown`.
 - bash 4+
-- **`unfsd`** — the [UNFS3](https://github.com/unfs3/unfs3) userspace NFSv3 server. This is the
-  only extra dependency. The installer gets it from the distro package where available, or
-  builds the official release automatically on Debian/Ubuntu:
+- **`flock`** from `util-linux` — normally installed by default on supported WSL
+  distros; used to coordinate concurrent share creation, recovery, teardown, and pruning.
+- **`unfsd`** — the [UNFS3](https://github.com/unfs3/unfs3) userspace NFSv3 server. The
+  installer gets it from the distro package where available, or builds the official release
+  automatically on Debian/Ubuntu:
 
   | Distro | |
   |---|---|
@@ -68,7 +70,24 @@ wslc run --mount type=bind,source=$(pwd),target=/work --rm alpine sh
 # everything else is forwarded straight to the real wslc
 wslc images
 wslc inspect my-container
+
+# stopped containers keep using their existing NFS-backed shares
+wslc stop my-container
+wslc start my-container        # restores the share first, then starts it
 ```
+
+`wslc start` restores any tracked NFS shares used by the existing container before delegating
+to the real WSLC start command. This allows a stopped container to recover after the WSL distro
+or container runtime VM has stopped without recreating the container. Recovery validates the
+saved `unfsd` process identity and export configuration before reusing a live NFS endpoint; an
+occupied endpoint whose identity cannot be verified is rejected rather than mounted. Tracked
+shares created by older versions are migrated in place when their running `unfsd` instance can
+be independently verified. Recovery also performs a bounded, force-synchronized probe of an
+existing NFS mount before reuse and verifies that its root fileid still matches the current source
+directory inode. An unhealthy mount is remounted only when no running container is using that
+volume. Existing-container start and run/create bind setup remain synchronized with mount repair
+until the runtime has consumed or committed the validated backing volumes; attached sessions do
+not retain that lifecycle lock afterward.
 
 `wslc volume remove` / `wslc volume prune` also tear down the matching NFS share. All other
 `volume` subcommands pass straight through.
@@ -96,7 +115,7 @@ volume.
 | `WSLC` | `wslc.exe` on PATH, else `/mnt/c/Program Files/WSL/wslc.exe` | path to the real wslc CLI |
 | `WSLC_REMOTE_UNFSD` | `unfsd` | path to the unfsd binary |
 | `WSLC_REMOTE_BASE_PORT` | `12049` | first port in the range used for NFS servers |
-| `WSLC_REMOTE_STATE` | `~/.local/state/wslc-remote` | share state, logs, exports |
+| `WSLC_REMOTE_STATE` | `~/.local/state/wslc-remote` | share state, lifecycle locks, logs, exports |
 
 The installer also takes `--dir DIR`, `--ref REF` and `--skip-deps`.
 

@@ -12,6 +12,8 @@
 #                 share, then the real `wslc` command is exec'd. Multiple binds
 #                 are handled; named volumes / tmpfs / non-dir sources pass
 #                 through untouched.
+#   start         Restore any tracked NFS-backed volumes used by the existing
+#                 container before forwarding to the real `wslc start`.
 #   volume        `remove`/`prune` also tear down (and reconcile) the matching
 #                 wslc-remote NFS share; every other volume subcommand passes
 #                 straight through to `wslc volume`.
@@ -33,9 +35,10 @@
 set -euo pipefail
 
 # wslc-remote serves each host bind over NFS using a single userspace NFSv3
-# server: UNFS3's `unfsd` (https://github.com/unfs3/unfs3). That binary is the
-# only extra dependency — nothing ships in this repo. Install it from that repo
-# and put it on PATH (or point WSLC_REMOTE_UNFSD=/path at an existing binary).
+# server: UNFS3's `unfsd` (https://github.com/unfs3/unfs3). Nothing ships in
+# this repo; `flock` from util-linux is also required for lifecycle locking.
+# Install unfsd from that repo and put it on PATH (or point
+# WSLC_REMOTE_UNFSD=/path at an existing binary).
 #
 # unfsd is launched with -s (single-user: all I/O as the invoking user, so a
 # container's volume-init chown/chmod SETATTR succeeds), -p (never register with
@@ -122,8 +125,10 @@ start_nfsd() {
   local ef="$STATE_DIR/$vol.exports" opts
   if [[ "$ro" == ro ]]; then opts="ro,insecure"; else opts="rw,no_root_squash,insecure"; fi
   printf '%s %s(%s)\n' "$dir" "$LOOPBACK" "$opts" >"$ef"
+  # FDs 199/200 are reserved for lifecycle locking. Close them in the
+  # background server so unfsd can never keep a lifecycle lock alive.
   nohup "$UNFSD_BIN" -s -p -t -d -l "$LOOPBACK" -n "$port" -m "$port" -e "$ef" \
-      >"$STATE_DIR/$vol.log" 2>&1 &
+      199>&- 200>&- >"$STATE_DIR/$vol.log" 2>&1 &
   NFSD_PID=$!
 }
 
@@ -140,6 +145,124 @@ alloc_port() {
 
 port_is_up()  { timeout 3 bash -c "exec 3<>/dev/tcp/$LOOPBACK/$1" 2>/dev/null; }
 vol_mounted() { session_run sh -c "grep -q ' /var/lib/docker/volumes/$1/_data nfs ' /proc/mounts" 2>/dev/null; }
+
+# runtime_uncached_stat_supported
+#
+# GNU stat --cached=never forces filesystem attributes to synchronize with the
+# server instead of accepting cached NFS metadata. Recovery must fail closed if
+# the runtime cannot perform that probe.
+runtime_uncached_stat_supported() {
+  timeout 5 "$WSLC" system session run \
+    stat --cached=never -Lc '%i' / \
+    </dev/null >/dev/null 2>&1
+}
+
+# vol_mount_healthy <volume> <hostdir>
+#
+# Do not trust /proc/mounts or cached NFS attributes alone. Force a server-side
+# attribute refresh through the existing root file handle, then compare the NFS
+# fileid with the inode of the directory currently exported by UNFS3.
+vol_mount_healthy() {
+  local vol="$1"
+  local dir="$2"
+
+  local source_inode
+  local mount_inode
+
+  [[ -d "$dir" ]] || return 1
+  vol_mounted "$vol" || return 1
+
+  source_inode="$(stat -Lc '%i' "$dir" 2>/dev/null)" || return 1
+  [[ "$source_inode" =~ ^[0-9]+$ ]] || return 1
+
+  if ! mount_inode="$(
+    timeout 5 "$WSLC" system session run \
+      stat --cached=never -Lc '%i' \
+        "/var/lib/docker/volumes/$vol/_data/." \
+      </dev/null 2>/dev/null |
+      tr -d '\r\n'
+  )"; then
+    return 1
+  fi
+
+  [[ "$mount_inode" =~ ^[0-9]+$ ]] || return 1
+  [[ "$mount_inode" == "$source_inode" ]]
+}
+
+# running_volume_users <volume>
+#
+# Print running container IDs that currently reference the backing volume.
+running_volume_users() {
+  session_run docker ps -q --filter "volume=$1" 2>/dev/null |
+    tr -d '\r'
+}
+
+# ensure_volume_mount_healthy <volume> <hostdir> <port>
+#
+# Keep a healthy existing mount. Missing or stale mounts may be recreated only
+# when no running container currently uses the volume; remounting underneath a
+# running container could leave its mount namespace inconsistent.
+ensure_volume_mount_healthy() {
+  local vol="$1"
+  local dir="$2"
+  local port="$3"
+
+  local mounted=0
+  local users=""
+
+  if ! runtime_uncached_stat_supported; then
+    warn "runtime cannot perform a force-synchronized stat; refusing NFS mount reuse or repair"
+    return 1
+  fi
+
+  if vol_mounted "$vol"; then
+    if vol_mount_healthy "$vol" "$dir"; then
+      return 0
+    fi
+    mounted=1
+  fi
+
+  if ! users="$(running_volume_users "$vol")"; then
+    warn "cannot determine whether running containers use '$vol'; refusing mount repair"
+    return 1
+  fi
+
+  if [[ -n "$users" ]]; then
+    users="${users//$'\n'/,}"
+    warn "NFS backing mount for '$vol' is missing or unhealthy, but running container(s) use it: $users. Stop them and retry."
+    return 1
+  fi
+
+  if (( mounted )); then
+    log "repairing unhealthy NFS backing mount for '$vol'"
+
+    if ! session_run sh -c "
+      T=/var/lib/docker/volumes/$vol/_data
+      umount -f \"\$T\" 2>/dev/null ||
+        umount -l \"\$T\" 2>/dev/null
+    "; then
+      warn "failed to unmount unhealthy backing store for '$vol'"
+      return 1
+    fi
+  else
+    log "remounting backing store for '$vol'"
+  fi
+
+  if ! session_run sh -c "
+    T=/var/lib/docker/volumes/$vol/_data
+    mkdir -p \"\$T\"
+    mount -i -t nfs -o $(nfs_opts "$port") :$dir \"\$T\"
+  "; then
+    warn "failed to mount backing store for '$vol'"
+    return 1
+  fi
+
+  if ! vol_mount_healthy "$vol" "$dir"; then
+    warn "backing store for '$vol' is still unhealthy after remount"
+    return 1
+  fi
+}
+
 
 # ---------------------------------------------------------------------------
 # abort_share <vol> <pid> : roll back a partially-created share so that a failure
@@ -158,104 +281,936 @@ abort_share() {
 }
 
 # ---------------------------------------------------------------------------
-# share <hostdir> [ro] [name] -> sets SHARE_VOL to the wslc guest volume name.
-# `ro` (the string "ro" or empty) selects a read-only NFS export. Internal:
-# invoked while rewriting host binds during `run`/`create`. Runs in the
-# caller's (main) shell — NOT inside a command substitution — so that a die() in
-# the sharing path (missing unfsd, no free port, mount failure, ...) aborts
-# wslc-remote entirely instead of being swallowed by a subshell and silently
-# falling back to an un-accelerated plain `wslc` command.
-share() {
-  [[ $# -ge 1 ]] || die "internal error: share() needs a host directory"
-  ensure_state; ensure_server
-  local dir ro vol port statef
-  dir="$(cd "$1" 2>/dev/null && pwd)" || die "no such directory: $1"
-  ro="${2:-}"
-  vol="${3:-$(vol_name_for "$dir" "$ro")}"
-  statef="$SHARES_DIR/$vol.env"
+# acquire_share_lock <volume>
+#
+# Normal lifecycle operations take a shared global barrier plus an exclusive
+# per-volume lock. This allows unrelated shares to proceed concurrently while
+# letting global operations such as `volume prune` stop all lifecycle mutation
+# before modifying the runtime volume set.
+acquire_share_lock() {
+  local vol="$1"
+  local barrier="$SHARES_DIR/.lifecycle.lock"
+  local lockf="$SHARES_DIR/$vol.restore.lock"
 
-  # Idempotent: reuse a healthy existing share.
-  if [[ -f "$statef" ]]; then
-    # shellcheck disable=SC1090
-    source "$statef"
-    if kill -0 "${PID:-0}" 2>/dev/null && port_is_up "$PORT" && vol_mounted "$vol"; then
-      log "reusing share: $dir -> volume '$vol' (port $PORT)"
-      SHARE_VOL="$vol"; return 0
+  ensure_state
+
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "cannot safely operate on share '$vol': 'flock' not found (install util-linux)"
+    return 1
+  fi
+
+  # FD 199: shared lifecycle barrier.
+  if ! exec 199>"$barrier"; then
+    warn "cannot open lifecycle barrier: $barrier"
+    return 1
+  fi
+
+  if ! flock -s -w 10 199; then
+    exec 199>&-
+    warn "timed out waiting for lifecycle barrier"
+    return 1
+  fi
+
+  # FD 200: exclusive lock for this volume.
+  if ! exec 200>"$lockf"; then
+    exec 199>&-
+    warn "cannot open lifecycle lock for '$vol': $lockf"
+    return 1
+  fi
+
+  if ! flock -w 10 200; then
+    exec 200>&-
+    exec 199>&-
+    warn "timed out waiting for lifecycle lock for '$vol'"
+    return 1
+  fi
+}
+
+release_share_lock() {
+  exec 200>&-
+  exec 199>&-
+}
+
+# acquire_start_barrier
+#
+# Starting an existing container spans restore + native container startup.
+# Hold the global lifecycle barrier exclusively across that handoff so another
+# recovery/teardown cannot repair or unmount a backing store between validation
+# and the runtime binding it into the container.
+acquire_start_barrier() {
+  local barrier="$SHARES_DIR/.lifecycle.lock"
+
+  ensure_state
+
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "cannot safely start container: 'flock' not found (install util-linux)"
+    return 1
+  fi
+
+  if ! exec 199>"$barrier"; then
+    warn "cannot open lifecycle barrier: $barrier"
+    return 1
+  fi
+
+  if ! flock -w 30 199; then
+    exec 199>&-
+    warn "timed out waiting for lifecycle operations before container start"
+    return 1
+  fi
+}
+
+release_start_barrier() {
+  exec 199>&-
+}
+# acquire_prune_lock
+#
+# Global destructive operations take the lifecycle barrier exclusively. Once
+# acquired, no share creation, recovery, or explicit teardown can be in flight.
+acquire_prune_lock() {
+  local barrier="$SHARES_DIR/.lifecycle.lock"
+
+  ensure_state
+
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "cannot safely prune shares: 'flock' not found (install util-linux)"
+    return 1
+  fi
+
+  if ! exec 199>"$barrier"; then
+    warn "cannot open lifecycle barrier: $barrier"
+    return 1
+  fi
+
+  if ! flock -w 30 199; then
+    exec 199>&-
+    warn "timed out waiting for lifecycle operations before volume prune"
+    return 1
+  fi
+}
+
+release_prune_lock() {
+  exec 199>&-
+}
+# current_boot_id
+#
+# Linux gives every boot a unique identifier. Recording it prevents a PID from
+# a previous WSL instance from ever being accepted after PID reuse.
+current_boot_id() {
+  [[ -r /proc/sys/kernel/random/boot_id ]] || return 1
+  cat /proc/sys/kernel/random/boot_id
+}
+
+# process_start_ticks <pid>
+#
+# Field 22 of /proc/<pid>/stat is the process start time since boot. Combined
+# with boot_id it uniquely identifies the recorded process lifetime rather than
+# merely trusting a reusable numeric PID.
+process_start_ticks() {
+  local pid="$1"
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "/proc/$pid/stat" ]] || return 1
+
+  awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
+}
+
+# unfsd_process_matches_config <pid> <volume> <dir> <port> [ro]
+#
+# Verify that PID is actually our configured unfsd process. This deliberately
+# does not rely on the process name alone: executable identity, complete daemon
+# arguments, and exports-file contents must all match this tracked share.
+unfsd_process_matches_config() {
+  local pid="$1"
+  local vol="$2"
+  local dir="$3"
+  local port="$4"
+  local ro="${5:-}"
+
+  local ef="$STATE_DIR/$vol.exports"
+  local opts
+  local expected_cmd
+  local expected_exe
+  local live_exe
+  local actual_args
+  local expected_args
+  local expected_export
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  expected_cmd="$(command -v "$UNFSD_BIN" 2>/dev/null)" || return 1
+  expected_exe="$(readlink -f "$expected_cmd" 2>/dev/null)" || return 1
+  live_exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" || return 1
+
+  [[ "$live_exe" == "$expected_exe" ]] || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+
+  actual_args="$(
+    tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null |
+      tail -n +2
+  )" || return 1
+
+  expected_args="$(
+    printf '%s\n' \
+      -s \
+      -p \
+      -t \
+      -d \
+      -l "$LOOPBACK" \
+      -n "$port" \
+      -m "$port" \
+      -e "$ef"
+  )"
+
+  [[ "$actual_args" == "$expected_args" ]] || return 1
+
+  if [[ "$ro" == ro ]]; then
+    opts="ro,insecure"
+  else
+    opts="rw,no_root_squash,insecure"
+  fi
+
+  expected_export="$dir $LOOPBACK($opts)"
+
+  [[ -r "$ef" ]] || return 1
+  [[ "$(cat "$ef" 2>/dev/null)" == "$expected_export" ]] || return 1
+}
+
+# unfsd_matches_saved_identity
+#   <pid> <volume> <dir> <port> <ro> <boot-id> <pid-start>
+#
+# Validate both the persisted process lifetime identity and its expected unfsd
+# configuration. A PID from another boot or a recycled PID cannot match.
+unfsd_matches_saved_identity() {
+  local pid="$1"
+  local vol="$2"
+  local dir="$3"
+  local port="$4"
+  local ro="${5:-}"
+  local saved_boot="$6"
+  local saved_start="$7"
+
+  local boot
+  local start
+
+  [[ -n "$saved_boot" && -n "$saved_start" ]] || return 1
+
+  boot="$(current_boot_id)" || return 1
+  [[ "$boot" == "$saved_boot" ]] || return 1
+
+  start="$(process_start_ticks "$pid")" || return 1
+  [[ "$start" == "$saved_start" ]] || return 1
+
+  unfsd_process_matches_config \
+    "$pid" "$vol" "$dir" "$port" "$ro"
+}
+# state_has_saved_identity_field <statefile>
+#
+# True when the record contains any new-format process-lifetime identity field.
+# A partial record is intentionally included so it cannot fall back to legacy
+# cleanup semantics.
+state_has_saved_identity_field() {
+  grep -Eq '^(BOOT_ID|PID_START)=' "$1" 2>/dev/null
+}
+
+# saved_unfsd_lifetime_gone <pid> <boot-id> <pid-start>
+#
+# Return success only when the persisted process lifetime is conclusively gone:
+# another WSL boot, the PID no longer exists in the same boot, or that PID now
+# belongs to a different process lifetime. Unknown/partial identity fails closed.
+saved_unfsd_lifetime_gone() {
+  local pid="$1"
+  local saved_boot="$2"
+  local saved_start="$3"
+
+  local boot
+  local start
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -n "$saved_boot" && -n "$saved_start" ]] || return 1
+
+  boot="$(current_boot_id)" || return 1
+
+  if [[ "$boot" != "$saved_boot" ]]; then
+    return 0
+  fi
+
+  if [[ ! -d "/proc/$pid" ]]; then
+    return 0
+  fi
+
+  start="$(process_start_ticks "$pid")" || return 1
+
+  [[ "$start" != "$saved_start" ]]
+}
+# saved_unfsd_lifetime_inactive <pid> <boot-id> <pid-start>
+#
+# True only when the exact saved process lifetime can no longer own resources:
+# the boot changed, the PID disappeared/recycled, or the original process has
+# reached a terminal zombie/dead state.
+saved_unfsd_lifetime_inactive() {
+  local pid="$1"
+  local saved_boot="$2"
+  local saved_start="$3"
+
+  local boot
+  local start
+  local state
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -n "$saved_boot" && -n "$saved_start" ]] || return 1
+
+  boot="$(current_boot_id)" || return 1
+
+  if [[ "$boot" != "$saved_boot" ]]; then
+    return 0
+  fi
+
+  if [[ ! -d "/proc/$pid" ]]; then
+    return 0
+  fi
+
+  start="$(process_start_ticks "$pid")" || return 1
+
+  if [[ "$start" != "$saved_start" ]]; then
+    return 0
+  fi
+
+  state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" || return 1
+
+  [[ "$state" == Z || "$state" == X ]]
+}
+# wait_saved_unfsd_shutdown <pid> <boot-id> <pid-start> <port>
+#
+# A restored daemon usually belongs to an earlier wrapper invocation, so Bash
+# cannot wait(2) for it. Poll the persisted process lifetime instead. Only
+# continue once that exact lifetime is gone and the endpoint is no longer
+# accepting connections.
+wait_saved_unfsd_shutdown() {
+  local pid="$1"
+  local saved_boot="$2"
+  local saved_start="$3"
+  local port="$4"
+
+  local i
+
+  # Do not use Bash wait here: this daemon normally belongs to an earlier
+  # wrapper process and therefore is not our child. Poll its persisted lifetime
+  # and the listening endpoint instead.
+  for (( i=0; i<50; i++ )); do
+    if saved_unfsd_lifetime_inactive \
+        "$pid" "$saved_boot" "$saved_start"; then
+
+      if ! port_is_up "$port"; then
+        return 0
+      fi
     fi
-    stop_share "$vol" >/dev/null 2>&1 || true
+
+    sleep 0.1
+  done
+
+  return 1
+}
+# ensure_saved_unfsd_identity
+#   <statefile> <pid> <volume> <dir> <port> <ro> <boot-id> <pid-start>
+#
+# Existing records created before process identity tracking contain neither
+# BOOT_ID nor PID_START. Such a record may be upgraded in place only after the
+# live process is independently verified as the exact unfsd instance configured
+# for this share.
+#
+# If either identity key is already present, the record is not legacy. Both keys
+# must be present and their persisted identity must match; mismatched or partial
+# new-format records are never repaired automatically.
+ensure_saved_unfsd_identity() {
+  local statef="$1"
+  local pid="$2"
+  local vol="$3"
+  local dir="$4"
+  local port="$5"
+  local ro="${6:-}"
+  local saved_boot="$7"
+  local saved_start="$8"
+
+  local has_boot=0
+  local has_start=0
+
+  grep -q '^BOOT_ID=' "$statef" 2>/dev/null && has_boot=1
+  grep -q '^PID_START=' "$statef" 2>/dev/null && has_start=1
+
+  # Any identity field means this is a new-format record. Never reinterpret a
+  # malformed or mismatched new record as legacy state.
+  if (( has_boot || has_start )); then
+    (( has_boot && has_start )) || return 1
+    [[ -n "$saved_boot" && -n "$saved_start" ]] || return 1
+
+    unfsd_matches_saved_identity \
+      "$pid" "$vol" "$dir" "$port" "$ro" \
+      "$saved_boot" "$saved_start"
+    return
+  fi
+
+  # Genuine legacy record: trust it only after independently verifying the
+  # executable, complete daemon arguments and exports configuration.
+  if ! unfsd_process_matches_config \
+      "$pid" "$vol" "$dir" "$port" "$ro"; then
+    return 1
+  fi
+
+  log "migrating legacy share state for volume '$vol'"
+
+  if ! write_share_state_atomic \
+      "$statef" "$dir" "$vol" "$port" "$pid" "$ro"; then
+    warn "failed to migrate legacy share state for '$vol'"
+    return 1
+  fi
+
+  return 0
+}
+# share_locked <hostdir> [ro] <volume>
+#
+# Caller must hold the per-volume lifecycle lock or the exclusive lifecycle barrier.
+share_locked() {
+  local dir="$1"
+  local ro="${2:-}"
+  local vol="$3"
+  local statef="$SHARES_DIR/$vol.env"
+  local port
+  local pid
+  local i
+
+  # An existing tracked share must be recovered in place. Never tear it down
+  # implicitly: existing containers may still reference this exact volume.
+  if [[ -f "$statef" ]]; then
+    if restore_share_locked "$vol"; then
+      log "reusing share: $dir -> volume '$vol'"
+      SHARE_VOL="$vol"
+      return 0
+    fi
+
+    die "existing share '$vol' could not be recovered safely; refusing destructive teardown while containers may still reference it. Remove the volume explicitly if teardown is intended."
   fi
 
   port="$(alloc_port)"
-  log "serving $dir over NFS on $LOOPBACK:$port${ro:+ (read-only)}"
-  start_nfsd "$vol" "$dir" "$port" "$ro"
-  local pid=$NFSD_PID
 
-  # Wait for OUR server to accept connections. Bail out the moment it dies (e.g.
-  # it couldn't bind the port): otherwise a *different* server already listening
-  # on $port would satisfy port_is_up and we'd mount against the wrong export.
-  local i
+  log "serving $dir over NFS on $LOOPBACK:$port${ro:+ (read-only)}"
+
+  start_nfsd "$vol" "$dir" "$port" "$ro"
+  pid="$NFSD_PID"
+
+  # Wait for OUR server to accept connections. Bail out the moment it dies;
+  # another server listening on this port must not satisfy the health check.
   for (( i=0; i<50; i++ )); do
     kill -0 "$pid" 2>/dev/null || break
     port_is_up "$port" && break
     sleep 0.1
   done
+
   if ! kill -0 "$pid" 2>/dev/null; then
     abort_share "$vol" "$pid"
     die "NFS server (unfsd) exited at startup — port $port may be held by a stale server. See $STATE_DIR/$vol.log"
   fi
+
   if ! port_is_up "$port"; then
     abort_share "$vol" "$pid"
     die "NFS server did not come up on $LOOPBACK:$port (see $STATE_DIR/$vol.log)"
   fi
 
   log "creating wslc guest volume '$vol' and NFS-mounting its backing store"
-  "$WSLC" volume create --driver guest "$vol" >/dev/null 2>&1 </dev/null || true
+
+  "$WSLC" volume create --driver guest "$vol" \
+    >/dev/null 2>&1 </dev/null || true
+
   if ! session_run sh -c "
     T=/var/lib/docker/volumes/$vol/_data
     mkdir -p \"\$T\"
-    grep -q \" \$T nfs \" /proc/mounts || mount -i -t nfs -o $(nfs_opts "$port") :$dir \"\$T\"
+    grep -q \" \$T nfs \" /proc/mounts ||
+      mount -i -t nfs -o $(nfs_opts "$port") :$dir \"\$T\"
   "; then
     abort_share "$vol" "$pid"
     die "failed to NFS-mount volume backing store (see $STATE_DIR/$vol.log)"
   fi
 
-  cat > "$statef" <<EOF
-DIR=$dir
-VOLUME=$vol
-PORT=$port
-PID=$pid
-RO=$ro
-EOF
+  # Use the same atomic state writer as recovery so other processes never see
+  # a partially-created record.
+  if ! write_share_state_atomic \
+      "$statef" "$dir" "$vol" "$port" "$pid" "$ro"; then
+    abort_share "$vol" "$pid"
+    die "failed to persist share state for '$vol'"
+  fi
+
   log "share ready: $dir -> volume '$vol'"
   SHARE_VOL="$vol"
 }
 
-# ---------------------------------------------------------------------------
-stop_share() {
-  local vol="$1" statef="$SHARES_DIR/$1.env"
-  [[ -f "$statef" ]] || { warn "no such share: $vol"; return 1; }
+# share <hostdir> [ro] [name] -> sets SHARE_VOL to the wslc guest volume name.
+#
+# `ro` selects a read-only NFS export. Creation/reuse is serialized with
+# recovery and teardown using the same per-volume lifecycle lock.
+share() {
+  [[ $# -ge 1 ]] || die "internal error: share() needs a host directory"
+
+  ensure_state
+  ensure_server
+
+  local dir
+  local ro
+  local vol
+  local rc
+  local lifecycle_exclusive
+
+  dir="$(cd "$1" 2>/dev/null && pwd)" || die "no such directory: $1"
+  ro="${2:-}"
+  vol="${3:-$(vol_name_for "$dir" "$ro")}"
+  lifecycle_exclusive="${4:-0}"
+
+  if (( lifecycle_exclusive )); then
+    if share_locked "$dir" "$ro" "$vol"; then
+      rc=0
+    else
+      rc=$?
+    fi
+
+    return "$rc"
+  fi
+
+  if ! acquire_share_lock "$vol"; then
+    die "failed to acquire lifecycle lock for share '$vol'"
+  fi
+
+  if share_locked "$dir" "$ro" "$vol"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  release_share_lock
+
+  return "$rc"
+}
+
+# stop_share_locked <volume>
+#
+# Destructive teardown is allowed only on this explicit path. Caller must hold
+# the same lifecycle lock used by creation and recovery.
+stop_share_locked() {
+  local vol="$1"
+  local statef="$SHARES_DIR/$vol.env"
+
+  local DIR=""
+  local VOLUME=""
+  local PORT=""
+  local PID=""
+  local RO=""
+  local BOOT_ID=""
+  local PID_START=""
+  local server_verified=0
+
+  [[ -f "$statef" ]] || {
+    warn "no such share: $vol"
+    return 1
+  }
+
   # shellcheck disable=SC1090
   source "$statef"
-  # Guest volumes are docker local volumes in the runtime dockerd; remove any
-  # container still holding it (else volume removal fails), then unmount + remove.
+
+  # Verify or migrate the saved server before destructive teardown.
+  #
+  # If verification fails, an occupied endpoint remains fail-closed. With a
+  # free endpoint, new-format state may be cleaned only when boot/start identity
+  # proves that the recorded daemon lifetime is gone. Never signal a recycled
+  # PID. Legacy state remains conservative when a saved PID is still alive.
+  if ensure_saved_unfsd_identity \
+      "$statef" "$PID" "$vol" "$DIR" "$PORT" "$RO" \
+      "$BOOT_ID" "$PID_START"; then
+
+    server_verified=1
+    BOOT_ID=""
+    PID_START=""
+
+    # shellcheck disable=SC1090
+    source "$statef"
+
+  else
+    if [[ -n "$PORT" ]] && port_is_up "$PORT"; then
+      warn "cannot safely tear down share '$vol': NFS endpoint identity could not be verified"
+      return 1
+    fi
+
+    if state_has_saved_identity_field "$statef"; then
+      if saved_unfsd_lifetime_gone "$PID" "$BOOT_ID" "$PID_START"; then
+        log "saved NFS server lifetime for '$vol' is gone; cleaning state without signaling pid ${PID:-<unknown>}"
+      else
+        warn "cannot safely tear down share '$vol': saved process lifetime could not be proven gone"
+        return 1
+      fi
+
+    elif [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+      warn "cannot safely tear down legacy share '$vol': live saved process could not be verified"
+      return 1
+    fi
+  fi
+
   local cids
-  cids="$(session_run docker ps -aq --filter "volume=$vol" 2>/dev/null | tr -d '\r')"
+
+  cids="$(
+    session_run docker ps -aq --filter "volume=$vol" 2>/dev/null |
+      tr -d '\r'
+  )"
+
   if [[ -n "$cids" ]]; then
     log "removing containers using '$vol'"
+
     # shellcheck disable=SC2086
     session_run docker rm -f $cids >/dev/null 2>&1 || true
   fi
+
   log "unmounting + removing volume '$vol'"
-  session_run sh -c "umount -f /var/lib/docker/volumes/$vol/_data 2>/dev/null || true" || true
+
+  session_run sh -c \
+    "umount -f /var/lib/docker/volumes/$vol/_data 2>/dev/null || true" \
+    || true
+
   "$WSLC" volume remove "$vol" >/dev/null 2>&1 </dev/null \
     || session_run docker volume rm "$vol" >/dev/null 2>&1 \
     || warn "could not remove volume '$vol' (a container may still use it)"
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    log "stopping NFS server (pid $PID)"; kill "$PID" 2>/dev/null || true
-  fi
-  rm -f "$statef" "$STATE_DIR/$vol.log" "$STATE_DIR/$vol.exports"
-}
 
+  if (( server_verified )); then
+    if unfsd_matches_saved_identity \
+        "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
+      log "stopping NFS server (pid $PID)"
+      kill "$PID" 2>/dev/null || true
+
+    elif kill -0 "$PID" 2>/dev/null; then
+      warn "not stopping pid $PID for '$vol': saved NFS server identity changed during teardown"
+    fi
+  fi
+
+  rm -f \
+    "$statef" \
+    "$STATE_DIR/$vol.log" \
+    "$STATE_DIR/$vol.exports"
+}
+# stop_share <volume>
+#
+# Explicit teardown participates in the same lifecycle lock as creation and
+# recovery, so it cannot mutate the volume while either operation is in flight.
+stop_share() {
+  local vol="$1"
+  local rc
+
+  ensure_state
+
+  if ! acquire_share_lock "$vol"; then
+    return 1
+  fi
+
+  if stop_share_locked "$vol"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  release_share_lock
+
+  return "$rc"
+}
+# ---------------------------------------------------------------------------
+# Restore existing wslc-remote shares used by stopped containers.
+#
+# Unlike share(), this path MUST be non-destructive: starting an existing
+# container must never remove/recreate that container merely because its NFS
+# server or runtime mount disappeared.
+#
+# This is primarily needed after the WSL distro or the container runtime VM has
+# stopped. The container still references the same wslc guest volume, but the
+# userspace NFS server and/or the NFS mount backing that volume may no longer
+# exist.
+#
+# write_share_state_atomic <statefile> <dir> <volume> <port> <pid> [ro]
+#
+# Write share metadata through a temporary file in the same directory and rename
+# it into place. rename(2) is atomic on the same filesystem, so another wslc
+# process sourcing the state file can only observe the old complete record or
+# the new complete record, never a partially-written one.
+write_share_state_atomic() {
+  local statef="$1"
+  local dir="$2"
+  local vol="$3"
+  local port="$4"
+  local pid="$5"
+  local ro="${6:-}"
+
+  local tmp_statef
+  local boot_id
+  local pid_start
+
+  # Never persist a server identity unless the process itself matches the exact
+  # unfsd configuration. Endpoint reachability is checked by creation/recovery
+  # before they expose the share.
+  if ! unfsd_process_matches_config \
+      "$pid" "$vol" "$dir" "$port" "$ro"; then
+    return 1
+  fi
+
+  boot_id="$(current_boot_id)" || return 1
+  pid_start="$(process_start_ticks "$pid")" || return 1
+
+  tmp_statef="$(mktemp "${statef}.XXXXXX")" || return 1
+
+  if ! printf \
+      'DIR=%s\nVOLUME=%s\nPORT=%s\nPID=%s\nRO=%s\nBOOT_ID=%s\nPID_START=%s\n' \
+      "$dir" \
+      "$vol" \
+      "$port" \
+      "$pid" \
+      "$ro" \
+      "$boot_id" \
+      "$pid_start" \
+      >"$tmp_statef"; then
+    rm -f "$tmp_statef"
+    return 1
+  fi
+
+  if ! mv -f "$tmp_statef" "$statef"; then
+    rm -f "$tmp_statef"
+    return 1
+  fi
+}
+# restore_share_locked <volume>
+#
+# Caller must hold the per-volume restore lock or the exclusive lifecycle barrier.
+restore_share_locked() {
+  local vol="$1"
+  local statef="$SHARES_DIR/$vol.env"
+
+  local DIR=""
+  local VOLUME=""
+  local PORT=""
+  local PID=""
+  local RO=""
+  local BOOT_ID=""
+  local PID_START=""
+  local identity_ok=0
+
+  [[ -f "$statef" ]] || return 0
+
+  # shellcheck disable=SC1090
+  source "$statef"
+
+  if [[ -z "$DIR" || ! -d "$DIR" ]]; then
+    warn "cannot restore share '$vol': source directory no longer exists: ${DIR:-<unknown>}"
+    return 1
+  fi
+
+  if [[ -z "$PORT" ]]; then
+    warn "cannot restore share '$vol': no port recorded in $statef"
+    return 1
+  fi
+
+  ensure_server
+
+  if ensure_saved_unfsd_identity \
+      "$statef" \
+      "$PID" \
+      "$vol" \
+      "$DIR" \
+      "$PORT" \
+      "$RO" \
+      "$BOOT_ID" \
+      "$PID_START"; then
+
+    identity_ok=1
+
+    # A legacy migration may just have added these fields. Reload the atomic
+    # record so subsequent strict checks use the persisted identity.
+    BOOT_ID=""
+    PID_START=""
+
+    # shellcheck disable=SC1090
+    source "$statef"
+  fi
+
+  if (( identity_ok )) && port_is_up "$PORT"; then
+    :
+  else
+    # An occupied endpoint whose process identity is unknown must never be used
+    # as this share's NFS server.
+    if port_is_up "$PORT"; then
+      warn "cannot restore share '$vol': port $PORT is occupied but the saved NFS server identity could not be verified"
+      return 1
+    fi
+
+    # A verified daemon that is alive but no longer serving its endpoint may be
+    # safely stopped before replacing it. Revalidate immediately before kill so
+    # PID reuse cannot turn this cleanup into termination of an unrelated process.
+    if (( identity_ok )) &&
+       unfsd_matches_saved_identity \
+          "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
+      kill "$PID" 2>/dev/null || true
+
+      if ! wait_saved_unfsd_shutdown \
+          "$PID" "$BOOT_ID" "$PID_START" "$PORT"; then
+        warn "verified NFS server for '$vol' did not release its saved process lifetime and endpoint in time"
+        return 1
+      fi
+    fi
+
+    log "restoring NFS share: $DIR -> volume '$vol' (port $PORT)"
+
+    start_nfsd "$vol" "$DIR" "$PORT" "$RO"
+
+    local pid="$NFSD_PID"
+    local i
+
+    for (( i=0; i<50; i++ )); do
+      kill -0 "$pid" 2>/dev/null || break
+      port_is_up "$PORT" && break
+      sleep 0.1
+    done
+
+    if ! unfsd_process_matches_config \
+        "$pid" "$vol" "$DIR" "$PORT" "$RO" ||
+        ! port_is_up "$PORT"; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      warn "failed to restore verified NFS server for '$vol' on port $PORT"
+      return 1
+    fi
+
+    PID="$pid"
+
+    if ! write_share_state_atomic \
+        "$statef" "$DIR" "$vol" "$PORT" "$PID" "$RO"; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      warn "failed to persist restored NFS server identity for '$vol'"
+      return 1
+    fi
+  fi
+
+  "$WSLC" volume create --driver guest "$vol" \
+    >/dev/null 2>&1 </dev/null || true
+
+  if ! ensure_volume_mount_healthy "$vol" "$DIR" "$PORT"; then
+    return 1
+  fi
+
+  log "share ready: $DIR -> volume '$vol' (port $PORT)"
+}
+# restore_share <volume>
+#
+# Recovery uses the same per-volume lifecycle lock as share creation/reuse and
+# explicit teardown.
+restore_share() {
+  local vol="$1"
+  local rc
+
+  if ! acquire_share_lock "$vol"; then
+    return 1
+  fi
+
+  if restore_share_locked "$vol"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  release_share_lock
+
+  return "$rc"
+}
+# restore_container_shares <container>
+#
+# Inspect the existing container in the runtime VM and restore only volumes
+# tracked by wslc-remote. Ordinary named volumes are intentionally ignored.
+restore_container_shares() {
+  local container="$1"
+  local lifecycle_exclusive="${2:-0}"
+  local vol
+  local rc=0
+  local mounts
+  local native_out
+  local native_err
+  local native_rc
+  local native_errf
+  local normalized_out
+
+  ensure_state
+
+  if mounts="$(
+    session_run docker inspect \
+      --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' \
+      "$container" 2>/dev/null |
+      tr -d '\r'
+  )"; then
+    :
+  else
+    # A runtime-side docker inspect failure is not enough to conclude that the
+    # container is missing. Ask native WSLC to inspect the same object.
+    #
+    # Native `container inspect` prints an empty JSON array when no object
+    # matches. Keep stdout and stderr separate so this classification does not
+    # depend on localized human-readable error text.
+    native_errf="$(mktemp "$STATE_DIR/inspect-error.XXXXXX")" || {
+      warn "cannot create temporary file while inspecting container '$container'"
+      return 1
+    }
+
+    if native_out="$("$WSLC" container inspect "$container" 2>"$native_errf")"; then
+      native_rc=0
+    else
+      native_rc=$?
+    fi
+
+    native_err="$(cat "$native_errf")"
+    rm -f "$native_errf"
+
+    native_out="${native_out//$'\r'/}"
+    native_err="${native_err//$'\r'/}"
+    normalized_out="$(printf '%s' "$native_out" | tr -d '[:space:]')"
+
+    if [[ $native_rc -ne 0 && "$normalized_out" == "[]" ]]; then
+      # Absence is confirmed. Preserve native `wslc start` error reporting by
+      # returning success here and letting handle_start delegate to the real CLI.
+      return 0
+    fi
+
+    if [[ $native_rc -eq 0 ]]; then
+      # Native WSLC confirms that the container exists, so starting it without
+      # knowing its mounts would risk exposing an unmounted backing directory.
+      warn "failed to inspect mounts for existing container '$container'; refusing to start without restoring remote shares"
+      return 1
+    fi
+
+    # Native inspection itself failed for some reason other than a confirmed
+    # missing object. Fail closed rather than starting with unknown mount state.
+    warn "failed to inspect container '$container'; refusing to start without restoring remote shares"
+    [[ -n "$native_err" ]] && printf '%s\n' "$native_err" >&2
+    return 1
+  fi
+
+  while IFS= read -r vol; do
+    [[ -n "$vol" ]] || continue
+
+    # Only restore volumes created and tracked by wslc-remote.
+    [[ -f "$SHARES_DIR/$vol.env" ]] || continue
+
+    if (( lifecycle_exclusive )); then
+      # The caller owns the exclusive global lifecycle barrier, which is
+      # stronger than the normal per-volume restore lock.
+      if ! restore_share_locked "$vol"; then
+        rc=1
+      fi
+    else
+      if ! restore_share "$vol"; then
+        rc=1
+      fi
+    fi
+  done <<< "$mounts"
+
+  return "$rc"
+}
 # ---------------------------------------------------------------------------
 # Bind-mount detection + rewriting.
 
@@ -272,10 +1227,10 @@ is_host_path() {
 # read-only bind is exported read-only. On any non-host-dir / non-existent
 # source, set nothing and return 1 so the caller keeps the original source.
 nfsify_dir() {
-  local src="$1" ro="${2:-}" abs
+  local src="$1" ro="${2:-}" lifecycle_exclusive="${3:-0}" abs
   is_host_path "$src" || return 1
   abs="$(cd "$src" 2>/dev/null && pwd)" || { warn "bind source is not an existing directory, passing through: $src"; return 1; }
-  share "$abs" "$ro"
+  share "$abs" "$ro" "" "$lifecycle_exclusive"
   NFSIFY_VOL="$SHARE_VOL"
 }
 
@@ -284,12 +1239,27 @@ nfsify_dir() {
 # A `ro` option makes the NFS export read-only too. Called directly (not in a
 # subshell) so a die() in sharing aborts the program.
 rewrite_v_spec() {
-  local spec="$1" src rest opts ro=""
-  [[ "$spec" == *:* ]] || { REWRITE_SPEC="$spec"; return; }   # anonymous volume, leave as-is
-  src="${spec%%:*}"; rest="${spec#*:}"
-  [[ "$rest" == *:* ]] && opts="${rest#*:}" || opts=""         # opts follow the DST (second colon)
-  case ",$opts," in *,ro,*) ro="ro" ;; esac
-  if nfsify_dir "$src" "$ro"; then REWRITE_SPEC="$NFSIFY_VOL:$rest"; else REWRITE_SPEC="$spec"; fi
+  local spec="$1"
+  local lifecycle_exclusive="${2:-0}"
+  local src rest opts ro=""
+
+  REWRITE_REMOTE_VOL=""
+
+  [[ "$spec" == *:* ]] || { REWRITE_SPEC="$spec"; return; }
+  src="${spec%%:*}"
+  rest="${spec#*:}"
+  [[ "$rest" == *:* ]] && opts="${rest#*:}" || opts=""
+
+  case ",$opts," in
+    *,ro,*) ro="ro" ;;
+  esac
+
+  if nfsify_dir "$src" "$ro" "$lifecycle_exclusive"; then
+    REWRITE_SPEC="$NFSIFY_VOL:$rest"
+    REWRITE_REMOTE_VOL="$NFSIFY_VOL"
+  else
+    REWRITE_SPEC="$spec"
+  fi
 }
 
 # Convert a `--mount` spec into an equivalent `-v` spec, stored in MOUNT_SPEC
@@ -297,11 +1267,19 @@ rewrite_v_spec() {
 # NFS-ified; volume sources pass through as named volumes. Called directly (not
 # in a subshell) so a die() in sharing aborts the program.
 mount_to_v() {
-  local spec="$1" field key val src="" dst="" ro="" type=""
+  local spec="$1"
+  local lifecycle_exclusive="${2:-0}"
+  local field key val src="" dst="" ro="" type=""
   local -a fields=()
+
+  MOUNT_REMOTE_VOL=""
+
   while IFS= read -r field; do fields+=("$field"); done < <(printf '%s\n' "$spec" | tr ',' '\n')
+
   for field in "${fields[@]}"; do
-    key="${field%%=*}"; val="${field#*=}"
+    key="${field%%=*}"
+    val="${field#*=}"
+
     case "$key" in
       type)                    type="$val" ;;
       source|src)              src="$val" ;;
@@ -309,34 +1287,542 @@ mount_to_v() {
       readonly|ro)             [[ "$val" != false ]] && ro="ro" ;;
     esac
   done
+
   [[ -n "$dst" ]] || die "--mount missing destination/target: $spec"
-  if [[ "$type" == bind || -z "$type" ]] && nfsify_dir "$src" "$ro"; then src="$NFSIFY_VOL"; fi
-  if [[ -n "$ro" ]]; then MOUNT_SPEC="$src:$dst:ro"; else MOUNT_SPEC="$src:$dst"; fi
+
+  if [[ "$type" == bind || -z "$type" ]] &&
+     nfsify_dir "$src" "$ro" "$lifecycle_exclusive"; then
+    src="$NFSIFY_VOL"
+    MOUNT_REMOTE_VOL="$NFSIFY_VOL"
+  fi
+
+  if [[ -n "$ro" ]]; then
+    MOUNT_SPEC="$src:$dst:ro"
+  else
+    MOUNT_SPEC="$src:$dst"
+  fi
 }
 
+# Read /proc/<pid>/stat field 22 using shell builtins only. Guard processes
+# intentionally avoid spawning helpers that could inherit lifecycle FD 199.
+read_process_start_ticks_nofork() {
+  local pid="$1"
+  local stat_line
+  local rest
+  local -a fields=()
+
+  PROCESS_START_TICKS_NOFORK=""
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "/proc/$pid/stat" ]] || return 1
+
+  IFS= read -r stat_line <"/proc/$pid/stat" || return 1
+
+  [[ "$stat_line" == *") "* ]] || return 1
+
+  # Everything after the final ") " begins with field 3 (state).
+  rest="${stat_line##*) }"
+
+  read -r -a fields <<< "$rest"
+
+  # field 22 => offset 19 when field 3 is array index 0.
+  (( ${#fields[@]} >= 20 )) || return 1
+  [[ "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
+
+  PROCESS_START_TICKS_NOFORK="${fields[19]}"
+}
+
+process_lifetime_matches_nofork() {
+  local pid="$1"
+  local expected_start="$2"
+
+  read_process_start_ticks_nofork "$pid" || return 1
+
+  [[ "$PROCESS_START_TICKS_NOFORK" == "$expected_start" ]]
+}
+runtime_running_container_ids() {
+  local ids
+
+  ids="$(
+    exec 199>&- 200>&-
+    session_run docker ps -q 2>/dev/null |
+      tr -d '\r'
+  )" || return 1
+
+  printf '%s\n' "$ids"
+}
+
+container_uses_all_volumes() {
+  local container="$1"
+  shift
+
+  local mounts
+  local vol
+
+  mounts="$(
+    exec 199>&- 200>&-
+    session_run docker inspect \
+      --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' \
+      "$container" 2>/dev/null |
+      tr -d '\r'
+  )" || return 1
+
+  for vol in "$@"; do
+    grep -Fxq "$vol" <<< "$mounts" 199>&- 200>&- || return 1
+  done
+}
+
+handoff_run_barrier_until_new_volume_user() {
+  local baseline="$1"
+  shift
+
+  local -a volumes=("$@")
+  local owner_pid="$BASHPID"
+  local owner_start=""
+
+  if ! read_process_start_ticks_nofork "$owner_pid"; then
+    die "cannot record lifecycle guard owner identity"
+  fi
+
+  owner_start="$PROCESS_START_TICKS_NOFORK"
+
+  (
+    trap - EXIT HUP INT TERM
+
+    local ids
+    local id
+
+    while :; do
+      # Do not leave an orphaned lock holder if the owning wrapper lifetime
+      # disappears. Match start time as well as PID so PID reuse cannot make a
+      # dead owner appear alive.
+      if ! process_lifetime_matches_nofork "$owner_pid" "$owner_start"; then
+        exec 199>&-
+        exit 0
+      fi
+      if ids="$(runtime_running_container_ids)"; then
+        while IFS= read -r id; do
+          [[ -n "$id" ]] || continue
+
+          if grep -Fxq "$id" <<< "$baseline" 199>&- 200>&-; then
+            continue
+          fi
+
+          if container_uses_all_volumes "$id" "${volumes[@]}"; then
+            exec 199>&-
+            exit 0
+          fi
+        done <<< "$ids"
+      fi
+
+      sleep 0.05 199>&- 200>&-
+    done
+  ) &
+
+  START_BARRIER_GUARD_PID=$!
+
+  # The monitor now owns the remaining locked open-file description.
+  exec 199>&-
+}
+v_spec_has_host_dir() {
+  local spec="$1"
+  local src
+
+  [[ "$spec" == *:* ]] || return 1
+
+  src="${spec%%:*}"
+
+  is_host_path "$src" || return 1
+
+  [[ -d "$src" ]]
+}
+
+mount_spec_has_host_dir() {
+  local spec="$1"
+  local field
+  local key
+  local val
+  local src=""
+  local type=""
+  local -a fields=()
+
+  while IFS= read -r field; do
+    fields+=("$field")
+  done < <(printf '%s\n' "$spec" | tr ',' '\n')
+
+  for field in "${fields[@]}"; do
+    key="${field%%=*}"
+    val="${field#*=}"
+
+    case "$key" in
+      type)
+        type="$val"
+        ;;
+      source|src)
+        src="$val"
+        ;;
+    esac
+  done
+
+  [[ "$type" == bind || -z "$type" ]] || return 1
+  [[ -n "$src" ]] || return 1
+
+  is_host_path "$src" || return 1
+
+  [[ -d "$src" ]]
+}
+
+run_args_have_host_bind() {
+  local -a args=("$@")
+  local i
+  local a
+
+  for (( i=0; i<${#args[@]}; i++ )); do
+    a="${args[$i]}"
+
+    case "$a" in
+      -v|--volume)
+        if (( i + 1 < ${#args[@]} )); then
+          v_spec_has_host_dir "${args[$((i + 1))]}" &&
+            return 0
+
+          i=$((i + 1))
+        fi
+        ;;
+
+      -v=*|--volume=*)
+        v_spec_has_host_dir "${a#*=}" &&
+          return 0
+        ;;
+
+      --mount)
+        if (( i + 1 < ${#args[@]} )); then
+          mount_spec_has_host_dir "${args[$((i + 1))]}" &&
+            return 0
+
+          i=$((i + 1))
+        fi
+        ;;
+
+      --mount=*)
+        mount_spec_has_host_dir "${a#*=}" &&
+          return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
 # run_wslc <run|create> <args...> : transparently NFS-ify host binds, then run wslc.
 run_wslc() {
-  local sub="$1"; shift
+  local sub="$1"
+  shift
+
   [[ $# -ge 1 ]] || die "usage: wslc $sub <wslc $sub args...>"
+
+  local -a original_args=("$@")
+  local -a out=()
+  local -a startup_volumes=()
+  local a
+  local rc=0
+  local baseline=""
+
+  # Commands without host-directory binds never interact with wslc-remote
+  # shares, so they must not wait behind the lifecycle barrier.
+  if ! run_args_have_host_bind "${original_args[@]}"; then
+    log "wslc $sub ${original_args[*]}"
+    exec "$WSLC" "$sub" "${original_args[@]}"
+  fi
+
   ensure_state
-  local out=() a
+
+  # From the first host-backed bind through native startup, all rewritten
+  # volumes participate in one lifecycle transaction.
+  if ! acquire_start_barrier; then
+    die "failed to acquire lifecycle barrier before wslc $sub"
+  fi
+
   while [[ $# -gt 0 ]]; do
     a="$1"
+
     case "$a" in
-      -v|--volume)        shift; [[ $# -gt 0 ]] || die "$a requires an argument"
-                          rewrite_v_spec "$1"; out+=(-v "$REWRITE_SPEC") ;;
-      -v=*|--volume=*)    rewrite_v_spec "${a#*=}"; out+=(-v "$REWRITE_SPEC") ;;
-      --mount)            shift; [[ $# -gt 0 ]] || die "--mount requires an argument"
-                          mount_to_v "$1"; out+=(-v "$MOUNT_SPEC") ;;
-      --mount=*)          mount_to_v "${a#*=}"; out+=(-v "$MOUNT_SPEC") ;;
-      *)                  out+=("$a") ;;
+      -v|--volume)
+        shift
+        [[ $# -gt 0 ]] || die "$a requires an argument"
+        rewrite_v_spec "$1" 1
+        out+=(-v "$REWRITE_SPEC")
+        [[ -n "$REWRITE_REMOTE_VOL" ]] &&
+          startup_volumes+=("$REWRITE_REMOTE_VOL")
+        ;;
+
+      -v=*|--volume=*)
+        rewrite_v_spec "${a#*=}" 1
+        out+=(-v "$REWRITE_SPEC")
+        [[ -n "$REWRITE_REMOTE_VOL" ]] &&
+          startup_volumes+=("$REWRITE_REMOTE_VOL")
+        ;;
+
+      --mount)
+        shift
+        [[ $# -gt 0 ]] || die "--mount requires an argument"
+        mount_to_v "$1" 1
+        out+=(-v "$MOUNT_SPEC")
+        [[ -n "$MOUNT_REMOTE_VOL" ]] &&
+          startup_volumes+=("$MOUNT_REMOTE_VOL")
+        ;;
+
+      --mount=*)
+        mount_to_v "${a#*=}" 1
+        out+=(-v "$MOUNT_SPEC")
+        [[ -n "$MOUNT_REMOTE_VOL" ]] &&
+          startup_volumes+=("$MOUNT_REMOTE_VOL")
+        ;;
+
+      *)
+        out+=("$a")
+        ;;
     esac
+
     shift
   done
+
   log "wslc $sub ${out[*]}"
-  exec "$WSLC" "$sub" "${out[@]}"
+
+  # No NFS-backed bind was produced. Nothing needs startup protection.
+  if (( ${#startup_volumes[@]} == 0 )); then
+    release_start_barrier
+    exec "$WSLC" "$sub" "${out[@]}"
+  fi
+
+  if [[ "$sub" == create ]]; then
+    # Create does not start the container. Keep protection until creation has
+    # committed the volume references; a later `start` performs its own guarded
+    # restore/start transaction.
+    if "$WSLC" "$sub" "${out[@]}" 199>&- 200>&-; then
+      rc=0
+    else
+      rc=$?
+    fi
+
+    release_start_barrier
+    return "$rc"
+  fi
+
+  # `run` may remain attached for the entire container lifetime. Snapshot
+  # existing running IDs, then transfer the lock to a monitor that releases it
+  # only when a NEW running container has consumed every rewritten NFS volume.
+  if ! baseline="$(runtime_running_container_ids)"; then
+    release_start_barrier
+    die "failed to snapshot running containers before wslc run"
+  fi
+
+  # Arm cleanup before transferring ownership of FD 199, eliminating the
+  # signal window between monitor creation and cleanup registration.
+  arm_start_barrier_guard_cleanup
+
+  handoff_run_barrier_until_new_volume_user \
+    "$baseline" "${startup_volumes[@]}"
+
+  if "$WSLC" "$sub" "${out[@]}" 199>&- 200>&-; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  # Detached run returns after successful startup; attached run returns when the
+  # container exits. Failure also returns here. In every case, terminate any
+  # monitor that has not already observed the running container.
+  stop_start_barrier_guard
+  disarm_start_barrier_guard_cleanup
+
+  return "$rc"
 }
 
+# handle_start <args...> : restore any wslc-remote shares referenced by the
+# existing container before delegating to the real `wslc start`.
+#
+# Container configuration is not recreated or rewritten here. This mirrors the
+# normal container lifecycle semantics: start operates on the existing container.
+container_is_running() {
+  local container="$1"
+  local running
+
+  running="$(
+    # Only this monitor shell owns the lifecycle lock. Probe children must
+    # never inherit it or survive monitor cancellation while retaining it.
+    exec 199>&- 200>&-
+
+    session_run docker inspect \
+      --format '{{.State.Running}}' \
+      "$container" 2>/dev/null |
+      tr -d '\r'
+  )" || return 1
+
+  [[ "$running" == true ]]
+}
+
+# handoff_start_barrier_until_running <container>
+#
+# Transfer the exclusive lifecycle barrier to a short-lived monitor. The caller
+# then closes its copy before invoking native `wslc start --attach` in the
+# foreground, preserving native console semantics. The monitor releases the
+# barrier as soon as the runtime reports the container running.
+handoff_start_barrier_until_running() {
+  local container="$1"
+  local owner_pid="$BASHPID"
+  local owner_start=""
+
+  if ! read_process_start_ticks_nofork "$owner_pid"; then
+    die "cannot record lifecycle guard owner identity"
+  fi
+
+  owner_start="$PROCESS_START_TICKS_NOFORK"
+
+  (
+    trap - EXIT HUP INT TERM
+
+    while :; do
+      if ! process_lifetime_matches_nofork "$owner_pid" "$owner_start"; then
+        exec 199>&-
+        exit 0
+      fi
+      if container_is_running "$container"; then
+        exec 199>&-
+        exit 0
+      fi
+
+      sleep 0.05 199>&- 200>&-
+    done
+  ) &
+
+  START_BARRIER_GUARD_PID=$!
+
+  # The guard now owns the remaining copy of the locked open-file description.
+  exec 199>&-
+}
+
+stop_start_barrier_guard() {
+  local pid="${START_BARRIER_GUARD_PID:-}"
+
+  [[ -n "$pid" ]] || return 0
+
+  # Never signal a process based only on numeric PID existence. If the guard
+  # already exited and Bash reaped it, that PID may have been reused by an
+  # unrelated process. Only a currently-running child job of this shell is
+  # eligible for cancellation.
+  if jobs -pr | grep -Fxq "$pid"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+
+  # wait is safe for the original child job and never signals a reused PID.
+  wait "$pid" 2>/dev/null || true
+
+  START_BARRIER_GUARD_PID=""
+}
+
+disarm_start_barrier_guard_cleanup() {
+  trap - EXIT HUP INT TERM
+}
+
+start_barrier_guard_signal_exit() {
+  local sig="$1"
+
+  stop_start_barrier_guard
+  disarm_start_barrier_guard_cleanup
+
+  # Preserve normal signal termination after cleanup.
+  kill -s "$sig" "$BASHPID"
+}
+
+arm_start_barrier_guard_cleanup() {
+  # A catchable wrapper termination must never bypass guard cleanup. Bash
+  # defers these traps while a foreground native command is executing, so the
+  # lifecycle barrier remains protected until that startup command returns.
+  trap 'stop_start_barrier_guard' EXIT
+  trap 'start_barrier_guard_signal_exit HUP' HUP
+  trap 'start_barrier_guard_signal_exit INT' INT
+  trap 'start_barrier_guard_signal_exit TERM' TERM
+}
+handle_start() {
+  local -a args=("$@")
+  local container=""
+  local arg
+  local attach=0
+  local start_rc=0
+
+  # Current wslc start accepts one container ID/name plus flag-only options.
+  # Scan the whole argv so --attach is recognized before or after the
+  # positional container argument.
+  for arg in "${args[@]}"; do
+    case "$arg" in
+      -a|--attach)
+        attach=1
+        ;;
+      -i|--interactive)
+        ;;
+      --)
+        ;;
+      -*)
+        ;;
+      *)
+        [[ -n "$container" ]] || container="$arg"
+        ;;
+    esac
+  done
+
+  # Preserve native argument validation when no container was supplied.
+  if [[ -z "$container" ]]; then
+    exec "$WSLC" start "${args[@]}"
+  fi
+
+  if ! acquire_start_barrier; then
+    die "failed to acquire lifecycle barrier before starting container '$container'"
+  fi
+
+  # The exclusive barrier is stronger than each individual share lock and must
+  # remain held until native startup has consumed the validated backing mounts.
+  if ! restore_container_shares "$container" 1; then
+    release_start_barrier
+    die "failed to restore one or more remote shares for container '$container'"
+  fi
+
+  if (( attach )); then
+    # Keep native attach in the foreground so WSLC retains its normal console
+    # semantics. A short-lived guard inherits the exclusive lifecycle lock and
+    # releases it only after Docker reports the container running.
+    # Register signal/exit cleanup before the guard receives the only remaining
+    # copy of the lifecycle lock.
+    arm_start_barrier_guard_cleanup
+
+    handoff_start_barrier_until_running "$container"
+
+    if "$WSLC" start "${args[@]}" 199>&- 200>&-; then
+      start_rc=0
+    else
+      start_rc=$?
+    fi
+
+    # If native startup failed or the container exited before the monitor
+    # observed Running=true, ensure the guard cannot retain the barrier.
+    stop_start_barrier_guard
+    disarm_start_barrier_guard_cleanup
+
+    return "$start_rc"
+  fi
+
+  # Normal `start` is short-lived. Keep the barrier until the native command
+  # completes, but do not leak the lock FD into wslc.exe itself.
+  if "$WSLC" start "${args[@]}" 199>&- 200>&-; then
+    start_rc=0
+  else
+    start_rc=$?
+  fi
+
+  release_start_barrier
+  return "$start_rc"
+}
+
+# ---------------------------------------------------------------------------
 # handle_volume <volume subcommand> <args...> : a drop-in for `wslc volume` that
 # is aware of wslc-remote's NFS-backed shares. `remove`/`rm` of a tracked share
 # tears the whole share down (server + mount + state), and `prune` reconciles any
@@ -360,10 +1846,24 @@ handle_volume() {
       [[ $names -gt 0 ]] && { "$WSLC" volume remove "${passthrough[@]}" || rc=1; }
       exit $rc ;;
     prune)
-      shift; ensure_state
-      "$WSLC" volume prune "$@" || true
-      reconcile_shares
-      exit 0 ;;
+      shift
+      ensure_state
+
+      if ! acquire_prune_lock; then
+        die "failed to acquire lifecycle barrier for volume prune"
+      fi
+
+      local prune_rc=0
+
+      "$WSLC" volume prune "$@" || prune_rc=$?
+
+      if ! reconcile_shares; then
+        prune_rc=1
+      fi
+
+      release_prune_lock
+      exit "$prune_rc"
+      ;;
     *) exec "$WSLC" volume "$@" ;;
   esac
 }
@@ -372,21 +1872,99 @@ handle_volume() {
 # bare `wslc volume remove`/`prune`): stop its server and delete its state.
 reconcile_shares() {
   ensure_state
-  local f vol
+
+  local f
+  local vol
+  local volumes
+  local rc=0
+
+  if ! volumes="$(
+    session_run docker volume ls --format '{{.Name}}' 2>/dev/null |
+      tr -d '\r'
+  )"; then
+    warn "cannot reconcile shares: failed to list runtime volumes"
+    return 1
+  fi
+
   for f in "$SHARES_DIR"/*.env; do
     [[ -e "$f" ]] || continue
-    vol="$(basename "$f" .env)"
-    if ! vol_mounted "$vol"; then
-      log "share '$vol' backing volume gone; stopping server + cleaning state"
-      # shellcheck disable=SC1090
-      ( source "$f"; [[ -n "${PID:-}" ]] && kill "$PID" 2>/dev/null || true )
-      rm -f "$f" "$STATE_DIR/$vol.log" "$STATE_DIR/$vol.exports"
-    fi
-  done
-}
 
+    vol="$(basename "$f" .env)"
+
+    if grep -Fxq "$vol" <<< "$volumes"; then
+      continue
+    fi
+
+    local DIR=""
+    local VOLUME=""
+    local PORT=""
+    local PID=""
+    local RO=""
+    local BOOT_ID=""
+    local PID_START=""
+    local server_verified=0
+
+    # shellcheck disable=SC1090
+    source "$f"
+
+    if ensure_saved_unfsd_identity \
+        "$f" "$PID" "$vol" "$DIR" "$PORT" "$RO" \
+        "$BOOT_ID" "$PID_START"; then
+
+      server_verified=1
+      BOOT_ID=""
+      PID_START=""
+
+      # shellcheck disable=SC1090
+      source "$f"
+
+    else
+      if [[ -n "$PORT" ]] && port_is_up "$PORT"; then
+        warn "cannot reconcile share '$vol': NFS endpoint identity could not be verified; keeping state"
+        rc=1
+        continue
+      fi
+
+      if state_has_saved_identity_field "$f"; then
+        if saved_unfsd_lifetime_gone "$PID" "$BOOT_ID" "$PID_START"; then
+          log "saved NFS server lifetime for '$vol' is gone; cleaning state without signaling pid ${PID:-<unknown>}"
+        else
+          warn "cannot reconcile share '$vol': saved process lifetime could not be proven gone; keeping state"
+          rc=1
+          continue
+        fi
+
+      elif [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+        warn "cannot reconcile legacy share '$vol': live saved process could not be verified; keeping state"
+        rc=1
+        continue
+      fi
+    fi
+
+    log "share '$vol' backing volume gone; stopping server + cleaning state"
+
+    if (( server_verified )); then
+      if unfsd_matches_saved_identity \
+          "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
+        kill "$PID" 2>/dev/null || true
+
+      elif kill -0 "$PID" 2>/dev/null; then
+        warn "cannot safely clean share '$vol': server identity changed during reconciliation; keeping state"
+        rc=1
+        continue
+      fi
+    fi
+
+    rm -f \
+      "$f" \
+      "$STATE_DIR/$vol.log" \
+      "$STATE_DIR/$vol.exports"
+  done
+
+  return "$rc"
+}
 # ---------------------------------------------------------------------------
-# check_deps : verify the one extra dependency (unfsd) plus the wslc pieces
+# check_deps : verify required userspace tools plus the wslc pieces
 # wslc-remote relies on, ending with a real loopback reachability probe between
 # the runtime VM and this distro. No installs and no networking-mode assumptions.
 check_deps() {
@@ -402,11 +1980,23 @@ check_deps() {
     _fail "unfsd (UNFS3) not on PATH — install from https://github.com/unfs3/unfs3 or set WSLC_REMOTE_UNFSD"
   fi
 
+  if command -v flock >/dev/null 2>&1; then
+    _pass "share locking: $(command -v flock)"
+  else
+    _fail "flock not found — install util-linux"
+  fi
+
   if "$WSLC" version >/dev/null 2>&1; then _pass "wslc CLI: $WSLC"; else _fail "wslc CLI not found (set \$WSLC or install WSL container support)"; fi
 
   if session_run true >/dev/null 2>&1; then _pass "wslc runtime session works"; else _fail "cannot run in the wslc runtime session"; fi
 
   if session_run sh -c 'modprobe nfs 2>/dev/null; grep -qw nfs /proc/filesystems'; then _pass "runtime VM has an NFS client"; else _fail "runtime VM has no nfs client"; fi
+
+  if session_run stat --cached=never -Lc '%i' / >/dev/null 2>&1; then
+    _pass "runtime stat supports force-synchronized filesystem probes"
+  else
+    _fail "runtime stat lacks --cached=never support required for safe NFS recovery"
+  fi
 
   # The whole data path depends on the runtime VM reaching this distro over
   # 127.0.0.1. Test that capability directly instead of requiring a specific WSL
@@ -448,6 +2038,8 @@ Commands are handled as follows:
   run, create        Drop-in for 'wslc run'/'wslc create': every host bind mount
                      (-v /host:/ctr, --mount type=bind,...) is transparently
                      served over NFS instead of the slow default virtiofs share.
+  start              Restores NFS-backed shares used by an existing container,
+                     then delegates to the real 'wslc start'.
   volume             Drop-in for 'wslc volume': 'remove'/'prune' also tear down
                      the matching wslc-remote NFS share; all else passes through.
   <anything else>    Forwarded unchanged to 'wslc' (inspect, images, logs, exec,
@@ -480,6 +2072,7 @@ EOF
 cmd="${1:-}"; shift || true
 case "$cmd" in
   run|create)         run_wslc "$cmd" "$@" ;;
+  start)              handle_start "$@" ;;
   volume)             handle_volume "$@" ;;
   _check)             check_deps "$@" ;;
   _help|"")           usage ;;
