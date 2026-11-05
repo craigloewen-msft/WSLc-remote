@@ -6,7 +6,7 @@ Architecture: all
 Depends: bash (>= 4.0), iproute2
 Recommends: unfs3, curl | wget
 Suggests: build-essential, flex, bison, pkgconf | pkg-config, libtirpc-dev, rpcsvc-proto
-Maintainer: wslc-remote maintainers <noreply@example.invalid>
+Maintainer: Alistair Young <avatar@arkane-systems.net>
 Homepage: https://github.com/craigloewen-msft/WSLc-remote
 Description: NFS-accelerated drop-in for the WSL container CLI (wslc)
  Installs the wslc wrapper (and a "container" alias). Host bind mounts passed
