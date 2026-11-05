@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#
+# wslc-build-unfsd — build and install UNFS3's unfsd (with the WSL IPv4 socket
+# patch used by the wslc-remote installer) into /usr/local/sbin.
+# Use this where the distribution has no unfs3 package. Run as root.
+#
+set -euo pipefail
+
+VERSION="${WSLC_REMOTE_UNFS3_VERSION:-0.11.0}"
+PREFIX="${PREFIX:-/usr/local}"
+
+die() { echo "wslc-build-unfsd: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "run as root (sudo wslc-build-unfsd)"
+
+# `apt-cache show` also succeeds for a package that is merely named in another
+# package's Recommends (such as wslc-remote's own), so ask for a real candidate.
+unfs3_candidate() {
+  local c; c="$(apt-cache policy unfs3 2>/dev/null | awk '/Candidate:/{print $2}')"
+  [[ -n "$c" && "$c" != "(none)" ]]
+}
+
+if unfs3_candidate; then
+  [[ -n "${WSLC_BUILD_UNFSD_DRY_RUN:-}" ]] && { echo "apt"; exit 0; }
+  echo "unfs3 is packaged here; installing it with apt-get instead"
+  exec apt-get install -y unfs3
+fi
+[[ -n "${WSLC_BUILD_UNFSD_DRY_RUN:-}" ]] && { echo "source"; exit 0; }
+
+apt-get install -y build-essential flex bison pkg-config libtirpc-dev rpcsvc-proto curl ca-certificates
+
+work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+curl -fsSL "https://github.com/unfs3/unfs3/releases/download/unfs3-$VERSION/unfs3-$VERSION.tar.gz" \
+  -o "$work/unfs3.tar.gz" || die "download failed"
+tar -xzf "$work/unfs3.tar.gz" -C "$work"
+src="$work/unfs3-$VERSION"
+
+sed -i \
+  -e '/^[[:space:]]*sock = socket(PF_INET6, SOCK_DGRAM, 0);$/,+3c\
+    if (IN6_IS_ADDR_V4MAPPED(\&opt_bind_addr) ||\
+        IN6_IS_ADDR_V4COMPAT(\&opt_bind_addr)) {\
+        sock = socket(PF_INET, SOCK_DGRAM, 0);\
+    } else {\
+        sock = socket(PF_INET6, SOCK_DGRAM, 0);\
+        if ((sock == -1) \&\& (errno == EAFNOSUPPORT))\
+            sock = socket(PF_INET, SOCK_DGRAM, 0);\
+    }' \
+  -e '/^[[:space:]]*sock = socket(PF_INET6, SOCK_STREAM, 0);$/,+3c\
+    if (IN6_IS_ADDR_V4MAPPED(\&opt_bind_addr) ||\
+        IN6_IS_ADDR_V4COMPAT(\&opt_bind_addr)) {\
+        sock = socket(PF_INET, SOCK_STREAM, 0);\
+    } else {\
+        sock = socket(PF_INET6, SOCK_STREAM, 0);\
+        if ((sock == -1) \&\& (errno == EAFNOSUPPORT))\
+            sock = socket(PF_INET, SOCK_STREAM, 0);\
+    }' \
+  "$src/daemon.c" || die "could not patch daemon.c"
+
+( cd "$src" && ./configure >/dev/null && make -j"$(nproc)" >/dev/null ) || die "build failed"
+install -D -m 0755 "$src/unfsd" "$PREFIX/sbin/unfsd"
+echo "installed $PREFIX/sbin/unfsd"

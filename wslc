@@ -42,10 +42,29 @@ set -euo pipefail
 # rpcbind/portmap — that can wedge across WSL localhost forwarding), -t (TCP
 # only) and the same port for NFS and MOUNT. See start_nfsd() below.
 UNFSD_BIN="${WSLC_REMOTE_UNFSD:-unfsd}"
+# Distro packages put unfsd in /usr/sbin, which is not on every user's PATH.
+if [[ -z "${WSLC_REMOTE_UNFSD:-}" ]] && ! command -v unfsd >/dev/null 2>&1; then
+  for _d in /usr/local/sbin /usr/sbin /sbin; do
+    [[ -x "$_d/unfsd" ]] && { UNFSD_BIN="$_d/unfsd"; break; }
+  done
+  unset _d
+fi
 STATE_DIR="${WSLC_REMOTE_STATE:-$HOME/.local/state/wslc-remote}"
 SHARES_DIR="$STATE_DIR/shares"
 BASE_PORT="${WSLC_REMOTE_BASE_PORT:-12049}"
 LOOPBACK="127.0.0.1"
+# Address the runtime VM uses to reach unfsd in this distro. "auto" (default)
+# probes for one that works: loopback first (mirrored/virtioproxy networking),
+# then this distro's own IPv4 addresses (e.g. bridged networking). Set an IP to
+# force it; WSLC_REMOTE_CLIENT then optionally pins the client address the
+# export accepts (default: whatever the VM's connection is seen to come from).
+ADDR_MODE="${WSLC_REMOTE_ADDR:-auto}"
+NET_FILE="$STATE_DIR/net.env"
+# Resolved by resolve_net: BIND_ADDR is where unfsd listens and what the VM
+# dials; CLIENT_ADDR is the only client the NFS export admits.
+BIND_ADDR="$LOOPBACK"
+CLIENT_ADDR="$LOOPBACK"
+NET_RESOLVED=0
 
 # Resolve the Windows wslc CLI (PATH first, then the default install location).
 # Note wslc-remote installs itself as `wslc`, so we deliberately look for
@@ -71,7 +90,7 @@ fi
 # NFS options for the runtime VM's `mount(2)`. `mount -i` bypasses /sbin/mount.nfs
 # (which can hang on a portmapper probe over forwarded loopback) and issues the
 # syscall directly.
-nfs_opts() { echo "vers=3,addr=$LOOPBACK,port=$1,mountport=$1,mountvers=3,mountproto=tcp,proto=tcp,nolock,soft,timeo=600,retrans=3"; }
+nfs_opts() { echo "vers=3,addr=$BIND_ADDR,port=$1,mountport=$1,mountvers=3,mountproto=tcp,proto=tcp,nolock,soft,timeo=600,retrans=3"; }
 
 log()  { printf '\033[36m[wslc-remote]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33m[wslc-remote] warning:\033[0m %s\n' "$*" >&2; }
@@ -109,9 +128,9 @@ ensure_server() {
 }
 
 # start_nfsd <vol> <hostdir> <port> [ro] : launch unfsd serving <hostdir> on
-# $LOOPBACK:<port>. Sets NFSD_PID to the server's pid. The export is pinned to
-# the loopback client ($LOOPBACK) — the only address the runtime VM reaches this
-# distro on — rather than unfs3's default "any client", and is exported
+# $BIND_ADDR:<port>. Sets NFSD_PID to the server's pid. The export is pinned to
+# the one client ($CLIENT_ADDR) the runtime VM was seen to connect from — 127.0.0.1
+# under mirrored/virtioproxy — rather than unfs3's default "any client", and is exported
 # read-only when the bind was requested read-only (`-v ...:ro` /
 # `--mount ...,readonly`) so a `:ro` source can't be written through the
 # unauthenticated NFS export. `rw` binds keep `no_root_squash` (dockerd's
@@ -121,8 +140,8 @@ start_nfsd() {
   local vol="$1" dir="$2" port="$3" ro="${4:-}"
   local ef="$STATE_DIR/$vol.exports" opts
   if [[ "$ro" == ro ]]; then opts="ro,insecure"; else opts="rw,no_root_squash,insecure"; fi
-  printf '%s %s(%s)\n' "$dir" "$LOOPBACK" "$opts" >"$ef"
-  nohup "$UNFSD_BIN" -s -p -t -d -l "$LOOPBACK" -n "$port" -m "$port" -e "$ef" \
+  printf '%s %s(%s)\n' "$dir" "$CLIENT_ADDR" "$opts" >"$ef"
+  nohup "$UNFSD_BIN" -s -p -t -d -l "$BIND_ADDR" -n "$port" -m "$port" -e "$ef" \
       >"$STATE_DIR/$vol.log" 2>&1 &
   NFSD_PID=$!
 }
@@ -132,14 +151,111 @@ alloc_port() {
   used="$(cat "$SHARES_DIR"/*.env 2>/dev/null | sed -n 's/^PORT=//p' | tr '\n' ' ')"
   for (( port=BASE_PORT; port<BASE_PORT+128; port++ )); do
     [[ " $used " == *" $port "* ]] && continue   # reserved by one of our shares
-    port_is_up "$port" && continue               # in use by some other process (e.g. a stale server)
+    port_is_up "$port" "$LOOPBACK" && continue   # in use by some other process (e.g. a stale server)
     echo "$port"; return 0
   done
   die "no free port in range $BASE_PORT-$((BASE_PORT+127))"
 }
 
-port_is_up()  { timeout 3 bash -c "exec 3<>/dev/tcp/$LOOPBACK/$1" 2>/dev/null; }
+port_is_up()  { timeout 3 bash -c "exec 3<>/dev/tcp/${2:-$BIND_ADDR}/$1" 2>/dev/null; }
 vol_mounted() { session_run sh -c "grep -q ' /var/lib/docker/volumes/$1/_data nfs ' /proc/mounts" 2>/dev/null; }
+
+# ---------------------------------------------------------------------------
+# Network path: which address can the runtime VM use to reach unfsd here?
+#
+# We probe for capability rather than guessing from the WSL networking mode.
+
+# Candidate addresses of this distro, best first: the default-route source
+# address, then any other global IPv4 address.
+candidate_addrs() {
+  {
+    ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1
+    ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'
+  } | awk 'NF && !seen[$0]++' | head -n 6
+}
+
+# probe_addr <addr> : serve a scratch export on <addr> and connect to it from
+# the runtime VM, holding the connection open so we can read the client address
+# it arrives from. On success set PROBE_CLIENT and return 0.
+probe_addr() {
+  local addr="$1" port dir ef upid vpid i peer=""
+  PROBE_CLIENT=""
+  port="$(alloc_port)"
+  dir="$(mktemp -d)"; ef="$STATE_DIR/_probe.exports"
+  printf '%s *(ro,insecure)\n' "$dir" >"$ef"
+  "$UNFSD_BIN" -s -p -t -d -l "$addr" -n "$port" -m "$port" -e "$ef" >"$STATE_DIR/_probe.log" 2>&1 &
+  upid=$!
+  for (( i=0; i<30; i++ )); do
+    kill -0 "$upid" 2>/dev/null || break
+    port_is_up "$port" "$addr" && break
+    sleep 0.1
+  done
+  if kill -0 "$upid" 2>/dev/null && port_is_up "$port" "$addr"; then
+    session_run sh -c "timeout 4 sh -c 'exec 3<>/dev/tcp/$addr/$port; sleep 3'" >/dev/null 2>&1 &
+    vpid=$!
+    for (( i=0; i<40; i++ )); do
+      peer="$(ss -Htn state established "( src $addr:$port )" 2>/dev/null | awk 'NR==1{print $4}')"
+      [[ -n "$peer" ]] && break
+      sleep 0.1
+    done
+    kill "$vpid" 2>/dev/null || true; wait "$vpid" 2>/dev/null || true
+    peer="${peer%:*}"; peer="${peer#[}"; peer="${peer%]}"
+  fi
+  kill "$upid" 2>/dev/null || true; wait "$upid" 2>/dev/null || true
+  rm -rf "$dir"; rm -f "$ef" "$STATE_DIR/_probe.log"
+  [[ -n "$peer" ]] || return 1
+  PROBE_CLIENT="$peer"
+}
+
+# detect_net : set BIND_ADDR/CLIENT_ADDR (and NET_HOW) with no caching; return 1
+# if the runtime VM can reach this distro on none of the addresses tried.
+detect_net() {
+  local a
+  ensure_state
+  NET_TRIED=""
+  if [[ "$ADDR_MODE" != auto ]]; then
+    BIND_ADDR="$ADDR_MODE"; NET_HOW="WSLC_REMOTE_ADDR"
+    if [[ -n "${WSLC_REMOTE_CLIENT:-}" ]]; then CLIENT_ADDR="$WSLC_REMOTE_CLIENT"; return 0; fi
+    if probe_addr "$BIND_ADDR"; then NET_TRIED+="$BIND_ADDR: reachable"$'\n'; else NET_TRIED+="$BIND_ADDR: unreachable"$'\n'; return 1; fi
+    CLIENT_ADDR="$PROBE_CLIENT"; return 0
+  fi
+  for a in "$LOOPBACK" $(candidate_addrs); do
+    if ! probe_addr "$a"; then NET_TRIED+="$a: unreachable from the runtime VM"$'\n'; continue; fi
+    NET_TRIED+="$a: reachable"$'\n'
+    BIND_ADDR="$a"; CLIENT_ADDR="$PROBE_CLIENT"
+    if [[ "$a" == "$LOOPBACK" ]]; then NET_HOW="loopback"; else NET_HOW="detected"; fi
+    return 0
+  done
+  return 1
+}
+
+# resolve_net : detect_net with a cache. A cached non-loopback address is reused
+# while this distro still owns it (DHCP changes and 'wsl --shutdown' invalidate it).
+resolve_net() {
+  [[ "$NET_RESOLVED" == 1 ]] && return 0
+  ensure_state
+  if [[ "$ADDR_MODE" == auto && -f "$NET_FILE" ]]; then
+    local c_bind="" c_client=""
+    # shellcheck disable=SC1090
+    { source "$NET_FILE"; } 2>/dev/null || true
+    c_bind="${CACHED_BIND:-}"; c_client="${CACHED_CLIENT:-}"
+    if [[ -n "$c_bind" && -n "$c_client" ]] \
+       && { [[ "$c_bind" == "$LOOPBACK" ]] || ip -4 -o addr show 2>/dev/null | grep -qE "inet $c_bind/"; }; then
+      BIND_ADDR="$c_bind"; CLIENT_ADDR="$c_client"; NET_HOW="cached"; NET_RESOLVED=1; return 0
+    fi
+  fi
+  detect_net || die "the runtime VM cannot reach this distro's NFS server.
+  Tried: ${ADDR_MODE/auto/$LOOPBACK $(candidate_addrs | tr '\n' ' ')}
+  Check WSL networking (see the README), or set WSLC_REMOTE_ADDR to an address
+  of this distro that the VM can reach. 'wslc _check' shows the details."
+  if [[ "$BIND_ADDR" != "$LOOPBACK" ]]; then
+    warn "NFS server is listening on $BIND_ADDR (not loopback), restricted to client $CLIENT_ADDR"
+  fi
+  save_net
+  NET_RESOLVED=1
+}
+
+save_net() { printf 'CACHED_BIND=%s\nCACHED_CLIENT=%s\n' "$BIND_ADDR" "$CLIENT_ADDR" >"$NET_FILE"; }
 
 # ---------------------------------------------------------------------------
 # abort_share <vol> <pid> : roll back a partially-created share so that a failure
@@ -167,7 +283,7 @@ abort_share() {
 # falling back to an un-accelerated plain `wslc` command.
 share() {
   [[ $# -ge 1 ]] || die "internal error: share() needs a host directory"
-  ensure_state; ensure_server
+  ensure_state; ensure_server; resolve_net
   local dir ro vol port statef
   dir="$(cd "$1" 2>/dev/null && pwd)" || die "no such directory: $1"
   ro="${2:-}"
@@ -178,7 +294,8 @@ share() {
   if [[ -f "$statef" ]]; then
     # shellcheck disable=SC1090
     source "$statef"
-    if kill -0 "${PID:-0}" 2>/dev/null && port_is_up "$PORT" && vol_mounted "$vol"; then
+    if [[ "${ADDR:-$LOOPBACK}" == "$BIND_ADDR" ]] && kill -0 "${PID:-0}" 2>/dev/null \
+       && port_is_up "$PORT" && vol_mounted "$vol"; then
       log "reusing share: $dir -> volume '$vol' (port $PORT)"
       SHARE_VOL="$vol"; return 0
     fi
@@ -186,7 +303,7 @@ share() {
   fi
 
   port="$(alloc_port)"
-  log "serving $dir over NFS on $LOOPBACK:$port${ro:+ (read-only)}"
+  log "serving $dir over NFS on $BIND_ADDR:$port${ro:+ (read-only)}"
   start_nfsd "$vol" "$dir" "$port" "$ro"
   local pid=$NFSD_PID
 
@@ -205,7 +322,7 @@ share() {
   fi
   if ! port_is_up "$port"; then
     abort_share "$vol" "$pid"
-    die "NFS server did not come up on $LOOPBACK:$port (see $STATE_DIR/$vol.log)"
+    die "NFS server did not come up on $BIND_ADDR:$port (see $STATE_DIR/$vol.log)"
   fi
 
   log "creating wslc guest volume '$vol' and NFS-mounting its backing store"
@@ -216,6 +333,7 @@ share() {
     grep -q \" \$T nfs \" /proc/mounts || mount -i -t nfs -o $(nfs_opts "$port") :$dir \"\$T\"
   "; then
     abort_share "$vol" "$pid"
+    rm -f "$NET_FILE"   # re-detect the network path next time
     die "failed to NFS-mount volume backing store (see $STATE_DIR/$vol.log)"
   fi
 
@@ -223,6 +341,7 @@ share() {
 DIR=$dir
 VOLUME=$vol
 PORT=$port
+ADDR=$BIND_ADDR
 PID=$pid
 RO=$ro
 EOF
@@ -408,30 +527,24 @@ check_deps() {
 
   if session_run sh -c 'modprobe nfs 2>/dev/null; grep -qw nfs /proc/filesystems'; then _pass "runtime VM has an NFS client"; else _fail "runtime VM has no nfs client"; fi
 
-  # The whole data path depends on the runtime VM reaching this distro over
-  # 127.0.0.1. Test that capability directly instead of requiring a specific WSL
-  # networking mode: serve a scratch directory and connect from the runtime VM.
+  # The whole data path depends on the runtime VM reaching this distro. Test that
+  # capability directly (loopback first, then this distro's own addresses)
+  # instead of requiring a specific WSL networking mode.
   if command -v "$UNFSD_BIN" >/dev/null 2>&1 && session_run true >/dev/null 2>&1; then
-    ensure_state
-    local probe_port probe_dir probe_exports probe_pid
-    probe_dir="$(mktemp -d)"
-    probe_exports="$STATE_DIR/_check.exports"
-    probe_port="$(alloc_port)"
-    printf '%s %s(ro,insecure)\n' "$probe_dir" "$LOOPBACK" >"$probe_exports"
-    "$UNFSD_BIN" -s -p -t -d -l "$LOOPBACK" -n "$probe_port" -m "$probe_port" -e "$probe_exports" \
-        >"$STATE_DIR/_check.log" 2>&1 &
-    probe_pid=$!
-    local i
-    for (( i=0; i<30; i++ )); do port_is_up "$probe_port" && break; sleep 0.1; done
-    if ! port_is_up "$probe_port"; then
-      _fail "could not start a local NFS server on $LOOPBACK:$probe_port (see $STATE_DIR/_check.log)"
-    elif session_run sh -c "timeout 5 sh -c 'exec 3<>/dev/tcp/$LOOPBACK/$probe_port'" >/dev/null 2>&1; then
-      _pass "runtime VM can reach this distro on $LOOPBACK"
+    if detect_net; then
+      # Refresh the cache so that 'wslc run' uses exactly the address reported here.
+      [[ "$ADDR_MODE" == auto ]] && save_net
+      if [[ "$BIND_ADDR" == "$LOOPBACK" ]]; then
+        _pass "runtime VM can reach this distro on $LOOPBACK"
+      else
+        _pass "runtime VM can reach this distro on $BIND_ADDR (client $CLIENT_ADDR; $NET_HOW) — not loopback: the NFS server will listen on that address"
+      fi
+      printf '%s' "$NET_TRIED" | sed 's/^/         probed /'
     else
-      _fail "runtime VM cannot reach this distro on $LOOPBACK — check WSL localhost forwarding, then run 'wsl --shutdown'"
+      printf '%s' "$NET_TRIED" | sed 's/^/         probed /'
+
+      _fail "runtime VM cannot reach this distro on $LOOPBACK or its own addresses ($(candidate_addrs | tr '\n' ' ')) — check WSL networking, or set WSLC_REMOTE_ADDR"
     fi
-    kill "$probe_pid" 2>/dev/null || true
-    rm -rf "$probe_dir"; rm -f "$probe_exports" "$STATE_DIR/_check.log"
   fi
 
   echo
@@ -465,7 +578,9 @@ Install unfsd from https://github.com/unfs3/unfs3, or point WSLC_REMOTE_UNFSD at
 an existing binary. Run 'wslc _check' to verify everything is in place.
 
 Env: WSLC_REMOTE_BASE_PORT (default $BASE_PORT), WSLC_REMOTE_STATE (default $STATE_DIR),
-     WSLC_REMOTE_UNFSD (unfsd path), WSLC (path to the real wslc.exe)
+     WSLC_REMOTE_UNFSD (unfsd path), WSLC (path to the real wslc.exe),
+     WSLC_REMOTE_ADDR (auto: loopback, else a reachable address of this distro;
+     or an IP to force), WSLC_REMOTE_CLIENT (client address the export admits)
 
 Examples:
   wslc _check                    # verify dependencies are installed
@@ -477,6 +592,7 @@ Examples:
 EOF
 }
 
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 cmd="${1:-}"; shift || true
 case "$cmd" in
   run|create)         run_wslc "$cmd" "$@" ;;
@@ -487,3 +603,4 @@ case "$cmd" in
   _*)                 die "unknown wslc-remote command '$cmd' (see: wslc _help)" ;;
   *)                  exec "$WSLC" "$cmd" "$@" ;;
 esac
+fi

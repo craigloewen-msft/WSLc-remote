@@ -13,3 +13,4 @@
 # Build / scratch
 /tmp/
 /build/
+/packaging/deb/dist/

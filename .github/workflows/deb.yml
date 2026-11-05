@@ -1,0 +1,63 @@
+name: deb package
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:stable, ubuntu:22.04, ubuntu:24.04]
+    steps:
+      - name: Install tooling
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git ca-certificates lintian shellcheck python3 iproute2
+      - uses: actions/checkout@v4
+      - name: Build, install and test the package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          packaging/deb/tests/test.sh
+      - name: Keep the built package
+        if: matrix.image == 'ubuntu:24.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wslc-remote-deb
+          path: packaging/deb/dist/*.deb
+
+  release:
+    name: build and publish release
+    # Only for pushes to main (i.e. a merged PR), and only once every test job passed.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the package
+        id: build
+        run: |
+          base="$(cat packaging/deb/VERSION)"
+          version="${base}+git$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+          deb="$(packaging/deb/build.sh "$version")"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "deb=$deb" >>"$GITHUB_OUTPUT"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.build.outputs.version }}"
+          gh release create "$tag" "${{ steps.build.outputs.deb }}" \
+            --target "$GITHUB_SHA" \
+            --title "wslc-remote ${{ steps.build.outputs.version }}" \
+            --generate-notes --latest
